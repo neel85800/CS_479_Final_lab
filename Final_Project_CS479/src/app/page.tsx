@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import Map from "../map";
 
 
@@ -11,7 +12,8 @@ export default function Home() {
 
   const connectToSerial = async () => {
     try {
-      const port = await navigator.serial.requestPort();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const port = await (navigator as any).serial.requestPort();
       await port.open({ baudRate: 115200 });
 
       setIsConnected(true);
@@ -73,6 +75,9 @@ export default function Home() {
         <button className="bg-green-500 hover:bg-green-700 text-white font-bold py-2 px-4 rounded" onClick={trackTrail} disabled={!isConnected}>
           {isTrailStarted ? "End Trail" : "Start Trail"}
         </button>
+        <Link href="/offline-map" className="bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">
+          Offline Map
+        </Link>
         <pre>{data}</pre>
         {isConnected && <Map />}
       </main>
