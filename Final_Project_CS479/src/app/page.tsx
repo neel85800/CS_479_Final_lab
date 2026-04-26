@@ -2,7 +2,6 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import Link from "next/link";
 import Map from "../map";
 
 
@@ -13,7 +12,6 @@ export default function Home() {
 
   const connectToSerial = async () => {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const port = await ((navigator as any) as any).serial.requestPort();
       await port.open({ baudRate: 115200 });
@@ -79,9 +77,6 @@ export default function Home() {
         </button>
         <Link href="/online-map" className="bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">
           Online Map
-        </Link>
-        <Link href="/offline-map" className="bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">
-          Offline Map
         </Link>
         <Link href="/offline-map" className="bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">
           Offline Map
