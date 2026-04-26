@@ -75,6 +75,9 @@ export default function Home() {
         <button className="bg-green-500 hover:bg-green-700 text-white font-bold py-2 px-4 rounded" onClick={trackTrail} disabled={!isConnected}>
           {isTrailStarted ? "End Trail" : "Start Trail"}
         </button>
+        <Link href="/online-map" className="bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">
+          Online Map
+        </Link>
         <Link href="/offline-map" className="bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">
           Offline Map
         </Link>
