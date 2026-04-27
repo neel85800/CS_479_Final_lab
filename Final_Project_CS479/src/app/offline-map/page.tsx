@@ -1,11 +1,17 @@
 "use client";
 
 import { useRef, useEffect, useState, useCallback } from "react";
+import { deadReckon, bearing } from "@/lib/deadReckon";
 
 interface TrailPoint {
   lat: number;
   lng: number;
   elevation: number;
+}
+
+interface LivePoint {
+  lat: number;
+  lng: number;
 }
 
 interface Sensor {
@@ -54,9 +60,10 @@ function headingToDir(h: number): string {
 }
 
 function aqStatus(ppm: number): { label: string; color: string } {
-  if (ppm < 400) return { label: "Good", color: "#22c55e" };
-  if (ppm < 1000) return { label: "Moderate", color: "#eab308" };
-  return { label: "Poor", color: "#ef4444" };
+  if (ppm <= 0) return { label: "NO DATA", color: "#6b7280" };
+  if (ppm < 450) return { label: "EXCELLENT", color: "#22c55e" };
+  if (ppm < 1000) return { label: "MODERATE", color: "#eab308" };
+  return { label: "POOR", color: "#ef4444" };
 }
 
 function renderCompass(canvas: HTMLCanvasElement, heading: number) {
@@ -122,31 +129,66 @@ function renderCompass(canvas: HTMLCanvasElement, heading: number) {
   ctx.fill();
 }
 
-function renderTrail(canvas: HTMLCanvasElement, trail: TrailPoint[]) {
+function renderTrail(
+  canvas: HTMLCanvasElement,
+  trail: TrailPoint[],
+  livePath: LivePoint[] = [],
+  hideTrail: boolean = false,
+  returnGuide: LivePoint[] = []
+) {
   const ctx = canvas.getContext("2d");
-  if (!ctx || trail.length === 0 || canvas.width === 0 || canvas.height === 0) return;
+  if (!ctx || canvas.width === 0 || canvas.height === 0) return;
 
   const w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = "#050505";
   ctx.fillRect(0, 0, w, h);
 
-  let minLat = trail[0].lat, maxLat = trail[0].lat;
-  let minLng = trail[0].lng, maxLng = trail[0].lng;
-  let minElev = trail[0].elevation, maxElev = trail[0].elevation;
+  // Choose what determines the visible bounds:
+  // - When recording (hideTrail), the live path + return guide are the focus.
+  // - Otherwise the Glen trail sets the bounds.
+  const useLivePathBounds = hideTrail && (livePath.length > 0 || returnGuide.length > 0);
+  const boundsSource: { lat: number; lng: number }[] = useLivePathBounds
+    ? [...livePath, ...returnGuide]
+    : trail;
+  if (boundsSource.length === 0) return;
 
-  for (const p of trail) {
+  let minLat = boundsSource[0].lat, maxLat = boundsSource[0].lat;
+  let minLng = boundsSource[0].lng, maxLng = boundsSource[0].lng;
+  for (const p of boundsSource) {
     if (p.lat < minLat) minLat = p.lat;
     if (p.lat > maxLat) maxLat = p.lat;
     if (p.lng < minLng) minLng = p.lng;
     if (p.lng > maxLng) maxLng = p.lng;
-    if (p.elevation < minElev) minElev = p.elevation;
-    if (p.elevation > maxElev) maxElev = p.elevation;
+  }
+
+  // Elevation range comes from the trail (live path has no elevation field).
+  let minElev = 0, maxElev = 1;
+  if (trail.length > 0) {
+    minElev = trail[0].elevation;
+    maxElev = trail[0].elevation;
+    for (const p of trail) {
+      if (p.elevation < minElev) minElev = p.elevation;
+      if (p.elevation > maxElev) maxElev = p.elevation;
+    }
   }
 
   const pad = 50;
-  const rangeX = maxLng - minLng || 0.001;
-  const rangeY = maxLat - minLat || 0.001;
+  // Tiny ranges (single point or near-stationary) are padded to a meaningful window
+  // (~1 km) so a fresh recording isn't zoomed into a single pixel.
+  const MIN_RANGE = 0.01;
+  const rangeX = Math.max(maxLng - minLng, MIN_RANGE);
+  const rangeY = Math.max(maxLat - minLat, MIN_RANGE);
+  if (maxLng - minLng < MIN_RANGE) {
+    const cx = (maxLng + minLng) / 2;
+    minLng = cx - rangeX / 2;
+    maxLng = cx + rangeX / 2;
+  }
+  if (maxLat - minLat < MIN_RANGE) {
+    const cy = (maxLat + minLat) / 2;
+    minLat = cy - rangeY / 2;
+    maxLat = cy + rangeY / 2;
+  }
   const scale = Math.min((w - pad * 2) / rangeX, (h - pad * 2) / rangeY);
   const ox = (w - scale * rangeX) / 2;
   const oy = (h - scale * rangeY) / 2;
@@ -167,34 +209,94 @@ function renderTrail(canvas: HTMLCanvasElement, trail: TrailPoint[]) {
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
   }
 
-  // Trail segments colored by elevation
-  ctx.lineWidth = 2.5;
-  ctx.lineJoin = "round";
-  ctx.lineCap = "round";
+  // Reference Glen trail (skipped while recording).
+  if (!hideTrail && trail.length > 0) {
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    for (let i = 1; i < trail.length; i++) {
+      const a = toXY(trail[i - 1].lat, trail[i - 1].lng);
+      const b = toXY(trail[i].lat, trail[i].lng);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.strokeStyle = elevToColor(trail[i].elevation, minElev, maxElev);
+      ctx.stroke();
+    }
 
-  for (let i = 1; i < trail.length; i++) {
-    const a = toXY(trail[i - 1].lat, trail[i - 1].lng);
-    const b = toXY(trail[i].lat, trail[i].lng);
+    // START marker
+    const sp = toXY(trail[0].lat, trail[0].lng);
     ctx.beginPath();
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(b.x, b.y);
-    ctx.strokeStyle = elevToColor(trail[i].elevation, minElev, maxElev);
+    ctx.arc(sp.x, sp.y, 5, 0, Math.PI * 2);
+    ctx.fillStyle = "#000";
+    ctx.fill();
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = "#fff";
+    ctx.font = "11px monospace";
+    ctx.textAlign = "left";
+    ctx.fillText("START", sp.x + 9, sp.y - 4);
+  }
+
+  // Live Arduino path overlay
+  if (livePath.length > 1) {
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = "#22d3ee";
+    ctx.beginPath();
+    const first = toXY(livePath[0].lat, livePath[0].lng);
+    ctx.moveTo(first.x, first.y);
+    for (let i = 1; i < livePath.length; i++) {
+      const p = toXY(livePath[i].lat, livePath[i].lng);
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+  }
+  if (livePath.length > 0) {
+    const last = livePath[livePath.length - 1];
+    const lp = toXY(last.lat, last.lng);
+    ctx.beginPath();
+    ctx.arc(lp.x, lp.y, 5, 0, Math.PI * 2);
+    ctx.fillStyle = "#22d3ee";
+    ctx.fill();
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 1.5;
     ctx.stroke();
   }
 
-  // START marker
-  const sp = toXY(trail[0].lat, trail[0].lng);
-  ctx.beginPath();
-  ctx.arc(sp.x, sp.y, 5, 0, Math.PI * 2);
-  ctx.fillStyle = "#000";
-  ctx.fill();
-  ctx.strokeStyle = "#fff";
-  ctx.lineWidth = 2;
-  ctx.stroke();
-  ctx.fillStyle = "#fff";
-  ctx.font = "11px monospace";
-  ctx.textAlign = "left";
-  ctx.fillText("START", sp.x + 9, sp.y - 4);
+  // Orange dashed return-route guide (reversed outbound path).
+  if (returnGuide.length > 1) {
+    ctx.save();
+    ctx.setLineDash([8, 4]);
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = "#f97316";
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    const fg = toXY(returnGuide[0].lat, returnGuide[0].lng);
+    ctx.moveTo(fg.x, fg.y);
+    for (let i = 1; i < returnGuide.length; i++) {
+      const p = toXY(returnGuide[i].lat, returnGuide[i].lng);
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    // Mark the origin (trail start) at the end of the guide.
+    const origin = returnGuide[returnGuide.length - 1];
+    const op = toXY(origin.lat, origin.lng);
+    ctx.beginPath();
+    ctx.arc(op.x, op.y, 6, 0, Math.PI * 2);
+    ctx.fillStyle = "#f97316";
+    ctx.fill();
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.fillStyle = "#fff";
+    ctx.font = "11px monospace";
+    ctx.textAlign = "left";
+    ctx.fillText("ORIGIN", op.x + 9, op.y - 4);
+  }
 }
 
 export default function OfflineMap() {
@@ -202,13 +304,29 @@ export default function OfflineMap() {
   const mapCanvasRef = useRef<HTMLCanvasElement>(null);
   const compassRef = useRef<HTMLCanvasElement>(null);
   const trailRef = useRef<TrailPoint[]>([]);
+  const livePathRef = useRef<LivePoint[]>([]);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const portRef = useRef<any>(null);
+  const demoIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const demoIndexRef = useRef(0);
 
   const [trail, setTrail] = useState<TrailPoint[]>([]);
   const [isDemoMode, setIsDemoMode] = useState(false);
   const [arduinoConnected, setArduinoConnected] = useState(false);
   const [sensor, setSensor] = useState<Sensor>(DEFAULT_SENSOR);
+  const [livePath, setLivePath] = useState<LivePoint[]>([]);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isReturnMode, setIsReturnMode] = useState(false);
+  const [returnGuide, setReturnGuide] = useState<LivePoint[]>([]);
+  const isRecordingRef = useRef(false);
+  const isReturnModeRef = useRef(false);
+  const returnGuideRef = useRef<LivePoint[]>([]);
 
   trailRef.current = trail;
+  livePathRef.current = livePath;
+  isRecordingRef.current = isRecording;
+  isReturnModeRef.current = isReturnMode;
+  returnGuideRef.current = returnGuide;
 
   // Load trail from CSV via API
   useEffect(() => {
@@ -227,40 +345,144 @@ export default function OfflineMap() {
     const ro = new ResizeObserver(() => {
       canvas.width = container.clientWidth;
       canvas.height = container.clientHeight;
-      if (trailRef.current.length > 0) renderTrail(canvas, trailRef.current);
+      const hideTrail = isRecordingRef.current || livePathRef.current.length > 1 || isReturnModeRef.current;
+      renderTrail(canvas, trailRef.current, livePathRef.current, hideTrail, returnGuideRef.current);
     });
     ro.observe(container);
     return () => ro.disconnect();
   }, []);
 
-  // Redraw when trail data arrives
+  // Redraw when trail, live path, recording state, or return guide changes
   useEffect(() => {
     const canvas = mapCanvasRef.current;
-    if (!canvas || trail.length === 0) return;
-    renderTrail(canvas, trail);
-  }, [trail]);
+    if (!canvas) return;
+    const hideTrail = isRecording || livePath.length > 1 || isReturnMode;
+    renderTrail(canvas, trail, livePath, hideTrail, returnGuide);
+  }, [trail, livePath, isRecording, isReturnMode, returnGuide]);
 
   // Compass
   useEffect(() => {
     if (compassRef.current) renderCompass(compassRef.current, sensor.heading);
   }, [sensor.heading]);
 
-  const toggleDemo = useCallback(() => {
-    setIsDemoMode((prev) => {
-      if (!prev && trailRef.current.length > 0) {
-        const first = trailRef.current[0];
-        setSensor((s) => ({ ...s, lat: first.lat, lng: first.lng, altitude: first.elevation }));
-      }
-      return !prev;
+  // Append a new dead-reckoned point to the live path based on the latest sensor packet.
+  // First Arduino packet seeds the path at trail[0] so it appears in the same coordinate space.
+  // Only runs while Record Trail is active.
+  const appendLivePoint = useCallback((update: Partial<Sensor>) => {
+    if (!isRecordingRef.current) return;
+    if (
+      update.heading === undefined ||
+      update.accelX === undefined ||
+      update.accelY === undefined ||
+      update.accelZ === undefined
+    ) return;
+
+    const path = livePathRef.current;
+    let origin: LivePoint;
+    if (path.length === 0) {
+      const trailStart = trailRef.current[0];
+      if (!trailStart) return; // wait until trail loads
+      origin = { lat: trailStart.lat, lng: trailStart.lng };
+    } else {
+      origin = path[path.length - 1];
+    }
+
+    const next = deadReckon(
+      origin.lat, origin.lng,
+      update.heading,
+      update.accelX, update.accelY, update.accelZ
+    );
+
+    if (next.lat === origin.lat && next.lng === origin.lng && path.length > 0) return;
+    setLivePath((p) => [...p, next]);
+  }, []);
+
+  // Record Trail — clears any previous live path; arduino dead-reckoned points are then
+  // appended via appendLivePoint while active. Origin in offline = trail[0] (no GPS).
+  const toggleRecord = useCallback(() => {
+    setIsRecording((prev) => {
+      if (prev) return false;
+      setLivePath([]); // first arduino packet will seed at trail[0]
+      return true;
     });
   }, []);
 
+  // Clear a finished recording (or return journey) and restore the Glen view.
+  const clearRecording = useCallback(() => {
+    setIsRecording(false);
+    setIsReturnMode(false);
+    setLivePath([]);
+    setReturnGuide([]);
+  }, []);
+
+  // Show the reversed outbound path as an orange guide and start tracking
+  // the return journey from where recording stopped.
+  const showReturnRoute = useCallback(() => {
+    const outbound = livePathRef.current;
+    if (outbound.length < 2) return;
+    const reversed = [...outbound].reverse();
+    setReturnGuide(reversed);
+    setLivePath([outbound[outbound.length - 1]]); // seed return journey at outbound endpoint
+    setIsReturnMode(true);
+    setIsRecording(true);
+  }, []);
+
+  const stopDemo = useCallback(() => {
+    if (demoIntervalRef.current) {
+      clearInterval(demoIntervalRef.current);
+      demoIntervalRef.current = null;
+    }
+  }, []);
+
+  const toggleDemo = useCallback(() => {
+    setIsDemoMode((prev) => {
+      const next = !prev;
+      if (!next) {
+        stopDemo();
+        return next;
+      }
+
+      const trail = trailRef.current;
+      if (trail.length < 2) return prev;
+
+      demoIndexRef.current = 0;
+      const start = trail[0];
+      setLivePath([{ lat: start.lat, lng: start.lng }]);
+      setSensor((s) => ({ ...s, lat: start.lat, lng: start.lng, altitude: start.elevation }));
+
+      demoIntervalRef.current = setInterval(() => {
+        const t = trailRef.current;
+        const i = ++demoIndexRef.current;
+        if (i >= t.length) {
+          stopDemo();
+          setIsDemoMode(false);
+          return;
+        }
+        const p = t[i];
+        const q = t[i - 1];
+        const hdg = bearing(q.lat, q.lng, p.lat, p.lng);
+        setSensor((s) => ({ ...s, lat: p.lat, lng: p.lng, heading: hdg, altitude: p.elevation }));
+        setLivePath((lp) => [...lp, { lat: p.lat, lng: p.lng }]);
+      }, 200);
+
+      return next;
+    });
+  }, [stopDemo]);
+
+  useEffect(() => () => stopDemo(), [stopDemo]);
+
   const connectArduino = useCallback(async () => {
+    if (portRef.current) return; // already connected
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const nav = navigator as any;
       const port = await nav.serial.requestPort();
-      await port.open({ baudRate: 115200 });
+      try {
+        await port.open({ baudRate: 115200 });
+      } catch (e) {
+        if (!(e instanceof DOMException && e.name === "InvalidStateError")) throw e;
+      }
+      portRef.current = port;
       setArduinoConnected(true);
 
       const decoder = new TextDecoderStream();
@@ -277,7 +499,10 @@ export default function OfflineMap() {
         buffer = lines.pop() ?? "";
 
         for (const line of lines) {
-          parseArduinoLine(line.trim(), setSensor);
+          const update = parseArduinoLine(line.trim());
+          if (!update) continue;
+          setSensor((prev) => ({ ...prev, ...update }));
+          appendLivePoint(update);
         }
       }
     } catch (err) {
@@ -299,9 +524,9 @@ export default function OfflineMap() {
           </span>
         </div>
         <div className="flex items-center gap-4">
-          <span className="text-xs flex items-center gap-1.5 text-green-400">
-            <span className="w-2 h-2 rounded-full bg-green-500 inline-block" />
-            GPS
+          <span className="text-xs flex items-center gap-1.5 text-gray-500">
+            <span className="w-2 h-2 rounded-full bg-gray-600 inline-block" />
+            No GPS
           </span>
           <span className="text-xs flex items-center gap-1.5 text-green-400">
             <span className={`w-2 h-2 rounded-full inline-block ${arduinoConnected ? "bg-green-500" : "bg-gray-600"}`} />
@@ -317,6 +542,49 @@ export default function OfflineMap() {
           >
             Demo Mode
           </button>
+          {!isReturnMode && (
+            <button
+              onClick={toggleRecord}
+              disabled={!arduinoConnected}
+              className={`text-[11px] px-3 py-1 rounded border transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                isRecording
+                  ? "border-red-500 text-red-400 bg-red-500/10"
+                  : "border-gray-600 text-gray-300 hover:border-gray-500"
+              }`}
+            >
+              {isRecording ? "● Recording" : "Record Trail"}
+            </button>
+          )}
+          {isReturnMode && (
+            <button
+              onClick={toggleRecord}
+              disabled={!arduinoConnected}
+              className={`text-[11px] px-3 py-1 rounded border transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                isRecording
+                  ? "border-orange-500 text-orange-400 bg-orange-500/10"
+                  : "border-gray-600 text-gray-300 hover:border-gray-500"
+              }`}
+            >
+              {isRecording ? "↩ Returning" : "↩ Return Route"}
+            </button>
+          )}
+          {!isRecording && livePath.length > 1 && !isReturnMode && (
+            <button
+              onClick={showReturnRoute}
+              disabled={!arduinoConnected}
+              className="text-[11px] px-3 py-1 rounded border border-orange-600 text-orange-400 hover:border-orange-500 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              ↩ Return Route
+            </button>
+          )}
+          {!isRecording && (livePath.length > 1 || isReturnMode) && (
+            <button
+              onClick={clearRecording}
+              className="text-[11px] px-3 py-1 rounded border border-gray-600 text-gray-300 hover:border-gray-500 cursor-pointer transition-colors"
+            >
+              ✕ Clear
+            </button>
+          )}
           {!arduinoConnected && (
             <button
               onClick={connectArduino}
@@ -391,32 +659,35 @@ export default function OfflineMap() {
   );
 }
 
-function parseArduinoLine(line: string, setSensor: React.Dispatch<React.SetStateAction<Sensor>>) {
-  // Expected format: KEY:value pairs separated by commas, e.g. "LAT:41.72,LNG:-87.97,..."
+function parseArduinoLine(line: string): Partial<Sensor> | null {
+  // Expected format: KEY:value pairs separated by commas, e.g. "HDG:45.2,TEMP:22.1,..."
+  if (!line) return null;
   const pairs = line.split(",");
   const update: Partial<Sensor> = {};
+  let any = false;
   for (const pair of pairs) {
     const [key, val] = pair.split(":");
     if (!key || val === undefined) continue;
     const v = parseFloat(val);
+    if (Number.isNaN(v)) continue;
     switch (key.trim().toUpperCase()) {
-      case "LAT": update.lat = v; break;
-      case "LNG": update.lng = v; break;
-      case "ACC": update.accuracy = v; break;
-      case "HDG": update.heading = v; break;
-      case "TEMP": update.temp = v; break;
-      case "PRES": update.pressure = v; break;
-      case "ALT": update.altitude = v; break;
-      case "PPM": update.ppm = v; break;
-      case "AX": update.accelX = v; break;
-      case "AY": update.accelY = v; break;
-      case "AZ": update.accelZ = v; break;
-      case "GX": update.gyroX = v; break;
-      case "GY": update.gyroY = v; break;
-      case "GZ": update.gyroZ = v; break;
+      case "LAT": update.lat = v; any = true; break;
+      case "LNG": update.lng = v; any = true; break;
+      case "ACC": update.accuracy = v; any = true; break;
+      case "HDG": update.heading = v; any = true; break;
+      case "TEMP": update.temp = v; any = true; break;
+      case "PRES": update.pressure = v; any = true; break;
+      case "ALT": update.altitude = v; any = true; break;
+      case "PPM": update.ppm = v; any = true; break;
+      case "AX": update.accelX = v; any = true; break;
+      case "AY": update.accelY = v; any = true; break;
+      case "AZ": update.accelZ = v; any = true; break;
+      case "GX": update.gyroX = v; any = true; break;
+      case "GY": update.gyroY = v; any = true; break;
+      case "GZ": update.gyroZ = v; any = true; break;
     }
   }
-  setSensor((prev) => ({ ...prev, ...update }));
+  return any ? update : null;
 }
 
 function SidePanel({ label, children }: { label: string; children: React.ReactNode }) {
