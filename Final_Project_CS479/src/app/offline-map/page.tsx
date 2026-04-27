@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useEffect, useState, useCallback } from "react";
-import { deadReckon, bearing } from "@/lib/deadReckon";
+import { deadReckon, bearing, isMpu6050Moving } from "@/lib/deadReckon";
 
 interface TrailPoint {
   lat: number;
@@ -29,6 +29,7 @@ interface Sensor {
   gyroX: number;
   gyroY: number;
   gyroZ: number;
+  moving: number;
 }
 
 const DEFAULT_SENSOR: Sensor = {
@@ -38,6 +39,7 @@ const DEFAULT_SENSOR: Sensor = {
   ppm: 0,
   accelX: 0, accelY: 0, accelZ: 0,
   gyroX: 0, gyroY: 0, gyroZ: 0,
+  moving: 0,
 };
 
 function elevToColor(e: number, min: number, max: number): string {
@@ -61,9 +63,12 @@ function headingToDir(h: number): string {
 
 function aqStatus(ppm: number): { label: string; color: string } {
   if (ppm <= 0) return { label: "NO DATA", color: "#6b7280" };
-  if (ppm < 450) return { label: "EXCELLENT", color: "#22c55e" };
+
+  // Hanwei MQ135 resistance/conductivity response: target gas concentration
+  // rises as sensor resistance/RsRo-style readings fall.
+  if (ppm < 450) return { label: "POOR", color: "#ef4444" };
   if (ppm < 1000) return { label: "MODERATE", color: "#eab308" };
-  return { label: "POOR", color: "#ef4444" };
+  return { label: "EXCELLENT", color: "#22c55e" };
 }
 
 function renderCompass(canvas: HTMLCanvasElement, heading: number) {
@@ -374,8 +379,18 @@ export default function OfflineMap() {
       update.heading === undefined ||
       update.accelX === undefined ||
       update.accelY === undefined ||
-      update.accelZ === undefined
+      update.accelZ === undefined ||
+      update.gyroX === undefined ||
+      update.gyroY === undefined ||
+      update.gyroZ === undefined
     ) return;
+
+    const moving = update.moving !== undefined
+      ? update.moving > 0
+      : isMpu6050Moving(
+          update.accelX, update.accelY, update.accelZ,
+          update.gyroX, update.gyroY, update.gyroZ
+        );
 
     const path = livePathRef.current;
     let origin: LivePoint;
@@ -383,14 +398,19 @@ export default function OfflineMap() {
       const trailStart = trailRef.current[0];
       if (!trailStart) return; // wait until trail loads
       origin = { lat: trailStart.lat, lng: trailStart.lng };
+      setLivePath([origin]);
     } else {
       origin = path[path.length - 1];
     }
 
+    if (!moving) return;
+
     const next = deadReckon(
       origin.lat, origin.lng,
       update.heading,
-      update.accelX, update.accelY, update.accelZ
+      update.accelX, update.accelY, update.accelZ,
+      update.gyroX, update.gyroY, update.gyroZ,
+      moving
     );
 
     if (next.lat === origin.lat && next.lng === origin.lng && path.length > 0) return;
@@ -685,6 +705,10 @@ function parseArduinoLine(line: string): Partial<Sensor> | null {
       case "GX": update.gyroX = v; any = true; break;
       case "GY": update.gyroY = v; any = true; break;
       case "GZ": update.gyroZ = v; any = true; break;
+      case "MOV":
+      case "MOVE":
+      case "MOTION":
+      case "MOVING": update.moving = v; any = true; break;
     }
   }
   return any ? update : null;

@@ -1,13 +1,36 @@
-// Raw MPU6050 accelerometer values are 16-bit signed at ±2g range,
-// so 1g ≈ 16384 LSB. We treat any deviation > MOVE_THRESHOLD as a step.
-const ACCEL_GRAVITY = 16384;
-const MOVE_THRESHOLD = 5000;
+// Supports either raw-ish MPU6050 values or Adafruit_MPU6050 event values.
+// Adafruit reports acceleration in m/s^2 and gyro rotation in rad/s.
+const RAW_ACCEL_GRAVITY = 16384;
+const RAW_ACCEL_MOVE_THRESHOLD = 3000;
+const SI_ACCEL_GRAVITY = 9.80665;
+const SI_ACCEL_MOVE_THRESHOLD = 1.2;
+const GYRO_DEG_PER_SEC_MOVE_THRESHOLD = 12;
+const GYRO_RAD_PER_SEC_MOVE_THRESHOLD = 0.25;
 const STEP_METERS = 0.6;
 const METERS_PER_DEG_LAT = 111000;
 
-export function isMoving(ax: number, ay: number, az: number): boolean {
-  const mag = Math.sqrt(ax * ax + ay * ay + az * az);
-  return Math.abs(mag - ACCEL_GRAVITY) > MOVE_THRESHOLD;
+export function isMpu6050Moving(
+  ax: number,
+  ay: number,
+  az: number,
+  gx: number,
+  gy: number,
+  gz: number
+): boolean {
+  const accelMag = Math.sqrt(ax * ax + ay * ay + az * az);
+  const gyroMag = Math.sqrt(gx * gx + gy * gy + gz * gz);
+
+  const usesSiUnits = accelMag < 100;
+  const accelGravity = usesSiUnits ? SI_ACCEL_GRAVITY : RAW_ACCEL_GRAVITY;
+  const accelThreshold = usesSiUnits ? SI_ACCEL_MOVE_THRESHOLD : RAW_ACCEL_MOVE_THRESHOLD;
+  const gyroThreshold = usesSiUnits
+    ? GYRO_RAD_PER_SEC_MOVE_THRESHOLD
+    : GYRO_DEG_PER_SEC_MOVE_THRESHOLD;
+
+  return (
+    Math.abs(accelMag - accelGravity) > accelThreshold ||
+    gyroMag > gyroThreshold
+  );
 }
 
 export function deadReckon(
@@ -16,9 +39,13 @@ export function deadReckon(
   heading: number,
   ax: number,
   ay: number,
-  az: number
+  az: number,
+  gx: number,
+  gy: number,
+  gz: number,
+  forceStep = false
 ): { lat: number; lng: number } {
-  if (!isMoving(ax, ay, az)) return { lat, lng };
+  if (!forceStep && !isMpu6050Moving(ax, ay, az, gx, gy, gz)) return { lat, lng };
 
   const rad = (heading * Math.PI) / 180;
   const dLat = (STEP_METERS * Math.cos(rad)) / METERS_PER_DEG_LAT;
