@@ -1,16 +1,15 @@
 "use client";
 
-import { useRef, useEffect, useState, useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
-import { deadReckon, bearing, isMpu6050Moving } from "@/lib/deadReckon";
-
-// --- Types ---
-interface TrailPoint {
-  lat: number;
-  lng: number;
-  elevation: number;
-}
+import {
+  createDeadReckoningState,
+  distanceMeters,
+  interpolateGeoPoint,
+  resetDeadReckoningState,
+  updateDeadReckoningPosition,
+} from "@/lib/deadReckon";
 
 interface LivePoint {
   lat: number;
@@ -32,16 +31,41 @@ interface Sensor {
   gyroX: number;
   gyroY: number;
   gyroZ: number;
+  accelMagDelta: number;
+  accelJerk: number;
+  gyroMag: number;
   moving: number;
+  turning: number;
 }
 
+type OriginSource = "none" | "browser" | "serial";
+
 const DEFAULT_SENSOR: Sensor = {
-  lat: 0, lng: 0, accuracy: 0, heading: 0,
-  temp: 0, pressure: 0, altitude: 0, ppm: 0,
-  accelX: 0, accelY: 0, accelZ: 0, gyroX: 0, gyroY: 0, gyroZ: 0,
+  lat: 0,
+  lng: 0,
+  accuracy: 0,
+  heading: 0,
+  temp: 0,
+  pressure: 0,
+  altitude: 0,
+  ppm: 0,
+  accelX: 0,
+  accelY: 0,
+  accelZ: 0,
+  gyroX: 0,
+  gyroY: 0,
+  gyroZ: 0,
+  accelMagDelta: 0,
+  accelJerk: 0,
+  gyroMag: 0,
   moving: 0,
+  turning: 0,
 };
 
+const GPS_CORRECTION_ACCURACY_METERS = 25;
+const GPS_APPEND_METERS = 1;
+const POSITION_MOTION_METERS = 1;
+const POSITION_MOTION_HOLD_MS = 1800;
 
 mapboxgl.accessToken = process.env.NEXT_PUBLIC_MAPBOX_SECRET_KEY;
 
@@ -50,63 +74,57 @@ export default function OnlineMap() {
   const mapRef = useRef<mapboxgl.Map | null>(null);
   const userMarkerRef = useRef<mapboxgl.Marker | null>(null);
   const compassRef = useRef<HTMLCanvasElement>(null);
+  const livePathRef = useRef<LivePoint[]>([]);
+  const returnGuideRef = useRef<LivePoint[]>([]);
+  const originRef = useRef<LivePoint | null>(null);
+  const lastRealPositionRef = useRef<LivePoint | null>(null);
+  const positionMotionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const trackingRef = useRef(createDeadReckoningState());
+  const isRecordingRef = useRef(false);
+  const isReturnModeRef = useRef(false);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const portRef = useRef<any>(null);
 
-  const [trail, setTrail] = useState<TrailPoint[]>([]);
   const [arduinoConnected, setArduinoConnected] = useState(false);
   const [sensor, setSensor] = useState<Sensor>(DEFAULT_SENSOR);
   const [mapLoaded, setMapLoaded] = useState(false);
-  const [isDemoMode, setIsDemoMode] = useState(false);
   const [livePath, setLivePath] = useState<LivePoint[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [isReturnMode, setIsReturnMode] = useState(false);
+  const [originSource, setOriginSource] = useState<OriginSource>("none");
   const [gpsStatus, setGpsStatus] = useState<"pending" | "ok" | "error">("pending");
-  const trailRef = useRef<TrailPoint[]>([]);
-  const livePathRef = useRef<LivePoint[]>([]);
-  const gpsOriginRef = useRef<LivePoint | null>(null);
-  const isRecordingRef = useRef(false);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const portRef = useRef<any>(null);
-  const demoIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const demoIndexRef = useRef(0);
-  livePathRef.current = livePath;
-  trailRef.current = trail;
-  isRecordingRef.current = isRecording;
-  
+  const [positionMoving, setPositionMoving] = useState(false);
 
-  // 1. Initialize Map
+  const hasOrigin = originSource !== "none";
+  const fusedMoving = sensor.moving > 0 || positionMoving;
+  const motionLabel = fusedMoving ? "MOVING" : sensor.turning > 0 ? "TURNING" : "STILL";
+  const motionColor = fusedMoving ? "#22c55e" : sensor.turning > 0 ? "#eab308" : "#9ca3af";
+
+  useEffect(() => {
+    livePathRef.current = livePath;
+  }, [livePath]);
+
+  useEffect(() => {
+    isRecordingRef.current = isRecording;
+  }, [isRecording]);
+
+  useEffect(() => {
+    isReturnModeRef.current = isReturnMode;
+  }, [isReturnMode]);
+
   useEffect(() => {
     if (!mapContainerRef.current) return;
 
     const map = new mapboxgl.Map({
       container: mapContainerRef.current,
       style: "mapbox://styles/mapbox/dark-v11",
-      center: [0, 0], // Starts at Null Island
-      zoom: 2,
-      pitch: 45,
+      center: [-98, 39],
+      zoom: 3,
+      pitch: 35,
       attributionControl: false,
     });
 
     map.on("load", () => {
-      // Add Trail Source
-      map.addSource("trail-source", {
-        type: "geojson",
-        data: { type: "FeatureCollection", features: [] },
-      });
-
-      // Add Trail Layer
-      map.addLayer({
-        id: "trail-layer",
-        type: "line",
-        source: "trail-source",
-        layout: { "line-join": "round", "line-cap": "round" },
-        paint: {
-          "line-color": "#f97316",
-          "line-width": 4,
-          "line-opacity": 0.8,
-        },
-      });
-
-      // Live (Arduino dead-reckoned) path — drawn as two layers to give the line a glow.
       map.addSource("live-path-source", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -134,7 +152,6 @@ export default function OnlineMap() {
         },
       });
 
-      // Return-route guide — the reversed outbound path shown as an orange dashed overlay.
       map.addSource("return-guide-source", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -147,7 +164,7 @@ export default function OnlineMap() {
         paint: {
           "line-color": "#f97316",
           "line-width": 3,
-          "line-opacity": 0.75,
+          "line-opacity": 0.8,
           "line-dasharray": [4, 3],
         },
       });
@@ -159,85 +176,120 @@ export default function OnlineMap() {
     return () => map.remove();
   }, []);
 
-  // 2. Load Trail Data via API
-  useEffect(() => {
-    fetch("/api/trail")
-      .then((r) => r.json())
-      .then((data: TrailPoint[]) => setTrail(data))
-      .catch((err) => console.error("Trail fetch error:", err));
+  const markPositionMoving = useCallback(() => {
+    setPositionMoving(true);
+    if (positionMotionTimerRef.current) clearTimeout(positionMotionTimerRef.current);
+    positionMotionTimerRef.current = setTimeout(() => {
+      setPositionMoving(false);
+      positionMotionTimerRef.current = null;
+    }, POSITION_MOTION_HOLD_MS);
   }, []);
 
-  // 3. Update Trail GeoJSON on Map
-  useEffect(() => {
-    if (!mapRef.current || !mapLoaded || trail.length === 0) return;
+  useEffect(() => () => {
+    if (positionMotionTimerRef.current) clearTimeout(positionMotionTimerRef.current);
+  }, []);
 
-    const coords = trail.map((p) => [p.lng, p.lat]);
-    const source = mapRef.current.getSource("trail-source") as mapboxgl.GeoJSONSource;
-    
-    if (source) {
-      source.setData({
-        type: "Feature",
-        properties: {},
-        geometry: { type: "LineString", coordinates: coords as any },
-      });
-
-      // Fit map to show the whole trail
-      const bounds = new mapboxgl.LngLatBounds();
-      coords.forEach((c) => bounds.extend(c as [number, number]));
-      mapRef.current.fitBounds(bounds, { padding: 50, duration: 1500 });
+  const applyRealPosition = useCallback((
+    point: LivePoint,
+    accuracy: number,
+    source: Exclude<OriginSource, "none">
+  ) => {
+    const previous = lastRealPositionRef.current;
+    const accuracyOk = accuracy <= 0 || accuracy <= GPS_CORRECTION_ACCURACY_METERS;
+    if (previous && accuracyOk && distanceMeters(previous, point) >= POSITION_MOTION_METERS) {
+      markPositionMoving();
     }
-  }, [trail, mapLoaded]);
+    lastRealPositionRef.current = point;
 
-  // 4a. Bootstrap origin from device GPS once
+    originRef.current = point;
+    setOriginSource(source);
+    if (source === "browser") setGpsStatus("ok");
+    setSensor((s) => ({
+      ...s,
+      lat: point.lat,
+      lng: point.lng,
+      accuracy,
+    }));
+
+    if (!isRecordingRef.current) {
+      setLivePath((path) => (path.length === 0 ? [point] : path));
+      if (mapRef.current && livePathRef.current.length <= 1) {
+        mapRef.current.flyTo({ center: [point.lng, point.lat], zoom: 17, duration: 1200 });
+      }
+      return;
+    }
+
+    if (accuracy > GPS_CORRECTION_ACCURACY_METERS) return;
+
+    setLivePath((path) => {
+      if (path.length === 0) return [point];
+      const last = path[path.length - 1];
+      const meters = distanceMeters(last, point);
+      if (meters < 1) return path;
+
+      const blend = accuracy <= 8 ? 1 : accuracy <= 15 ? 0.75 : 0.45;
+      const corrected = interpolateGeoPoint(last, point, blend);
+      return meters >= GPS_APPEND_METERS
+        ? [...path, corrected]
+        : [...path.slice(0, -1), corrected];
+    });
+  }, [markPositionMoving]);
+
   useEffect(() => {
     if (!mapLoaded) return;
     if (!navigator.geolocation) {
-      setGpsStatus("error");
+      window.setTimeout(() => setGpsStatus("error"), 0);
       return;
     }
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        const origin: LivePoint = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-        gpsOriginRef.current = origin;
-        setGpsStatus("ok");
-        setLivePath((p) => (p.length === 0 ? [origin] : p));
-        setSensor((s) => ({
-          ...s,
-          lat: origin.lat,
-          lng: origin.lng,
-          accuracy: Math.round(pos.coords.accuracy ?? 0),
-        }));
-        mapRef.current?.flyTo({ center: [origin.lng, origin.lat], zoom: 17, duration: 1500 });
-      },
-      (err) => {
-        console.warn("Geolocation failed:", err.message);
-        setGpsStatus("error");
-      },
-      { enableHighAccuracy: false, timeout: 20000, maximumAge: 120000 }
-    );
-  }, [mapLoaded]);
 
-  // 4b. Push live path to Mapbox + move marker / camera with the latest point
+    const onPosition = (pos: GeolocationPosition) => {
+      applyRealPosition(
+        { lat: pos.coords.latitude, lng: pos.coords.longitude },
+        Math.round(pos.coords.accuracy ?? 0),
+        "browser"
+      );
+    };
+
+    const onError = (err: GeolocationPositionError) => {
+      console.warn("Geolocation failed:", err.message);
+      if (!originRef.current) setGpsStatus("error");
+    };
+
+    navigator.geolocation.getCurrentPosition(onPosition, onError, {
+      enableHighAccuracy: true,
+      timeout: 15000,
+      maximumAge: 5000,
+    });
+    const watchId = navigator.geolocation.watchPosition(onPosition, onError, {
+      enableHighAccuracy: true,
+      timeout: 15000,
+      maximumAge: 5000,
+    });
+
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [applyRealPosition, mapLoaded]);
+
   useEffect(() => {
-    if (!mapRef.current || !mapLoaded || livePath.length === 0) return;
+    if (!mapRef.current || !mapLoaded) return;
 
-    const coords = livePath.map((p) => [p.lng, p.lat]);
     const source = mapRef.current.getSource("live-path-source") as mapboxgl.GeoJSONSource | undefined;
-    if (source) {
-      source.setData({
-        type: "Feature",
-        properties: {},
-        geometry: { type: "LineString", coordinates: coords },
-      });
-    }
+    const coords: [number, number][] = livePath.map((p) => [p.lng, p.lat]);
+    source?.setData(
+      coords.length > 1
+        ? {
+            type: "Feature",
+            properties: {},
+            geometry: { type: "LineString", coordinates: coords },
+          }
+        : { type: "FeatureCollection", features: [] }
+    );
 
+    if (livePath.length === 0) return;
     const last = livePath[livePath.length - 1];
     if (!userMarkerRef.current) {
       const el = document.createElement("div");
-      el.className = "w-5 h-5 bg-blue-500 border-2 border-white rounded-full shadow-[0_0_15px_rgba(59,130,246,0.9)]";
-      userMarkerRef.current = new mapboxgl.Marker(el)
-        .setLngLat([last.lng, last.lat])
-        .addTo(mapRef.current);
+      el.className = "w-5 h-5 bg-cyan-400 border-2 border-white rounded-full shadow-[0_0_15px_rgba(34,211,238,0.9)]";
+      userMarkerRef.current = new mapboxgl.Marker(el).setLngLat([last.lng, last.lat]).addTo(mapRef.current);
     } else {
       userMarkerRef.current.setLngLat([last.lng, last.lat]);
     }
@@ -245,25 +297,24 @@ export default function OnlineMap() {
     mapRef.current.easeTo({
       center: [last.lng, last.lat],
       bearing: sensor.heading,
-      duration: 800,
+      zoom: Math.max(mapRef.current.getZoom(), 17),
+      duration: 700,
     });
-  }, [livePath, sensor.heading, mapLoaded]);
+  }, [livePath, mapLoaded, sensor.heading]);
 
-  // Hide the reference Glen trail whenever there's any recorded data (during or after recording),
-  // so the user keeps the focus on their own path until they explicitly clear it.
   useEffect(() => {
-    if (!mapRef.current || !mapLoaded) return;
-    const map = mapRef.current;
-    const hideGlen = isRecording || livePath.length > 1 || isReturnMode;
-    if (map.getLayer("trail-layer")) {
-      map.setLayoutProperty("trail-layer", "visibility", hideGlen ? "none" : "visible");
-    }
-  }, [isRecording, isReturnMode, livePath.length, mapLoaded]);
+    if (compassRef.current) renderCompass(compassRef.current, sensor.heading);
+  }, [sensor.heading]);
 
-  // Append a dead-reckoned point to the live path. Origin = device GPS (set on mount).
-  // Only runs while Record Trail is active.
-  const appendLivePoint = useCallback((update: Partial<Sensor>) => {
-    if (!isRecordingRef.current) return;
+  const appendLivePoint = useCallback((update: Partial<Sensor>): LivePoint | null => {
+    if (update.lat !== undefined && update.lng !== undefined) {
+      const serialPoint = { lat: update.lat, lng: update.lng };
+      const accuracy = update.accuracy ?? 0;
+      applyRealPosition(serialPoint, accuracy, "serial");
+      return serialPoint;
+    }
+
+    if (!isRecordingRef.current) return null;
     if (
       update.heading === undefined ||
       update.accelX === undefined ||
@@ -272,42 +323,41 @@ export default function OnlineMap() {
       update.gyroX === undefined ||
       update.gyroY === undefined ||
       update.gyroZ === undefined
-    ) return;
-
-    const moving = update.moving !== undefined
-      ? update.moving > 0
-      : isMpu6050Moving(
-          update.accelX, update.accelY, update.accelZ,
-          update.gyroX, update.gyroY, update.gyroZ
-        );
+    ) return null;
 
     const path = livePathRef.current;
-    let origin: LivePoint | null;
-    if (path.length === 0) {
-      origin = gpsOriginRef.current;
-      if (!origin) return; // wait for GPS fix
-      setLivePath([origin]);
-    } else {
-      origin = path[path.length - 1];
-    }
+    const seedPath = path.length === 0;
+    const origin = seedPath ? originRef.current : path[path.length - 1];
+    if (!origin) return null;
 
-    if (!moving) return;
-
-    const next = deadReckon(
-      origin.lat, origin.lng,
-      update.heading,
-      update.accelX, update.accelY, update.accelZ,
-      update.gyroX, update.gyroY, update.gyroZ,
-      moving
+    const result = updateDeadReckoningPosition(
+      origin,
+      {
+        heading: update.heading,
+        accelX: update.accelX,
+        accelY: update.accelY,
+        accelZ: update.accelZ,
+        gyroX: update.gyroX,
+        gyroY: update.gyroY,
+        gyroZ: update.gyroZ,
+        moving: update.moving,
+      },
+      trackingRef.current,
+      { accelMode: "rawDelta" }
     );
 
-    if (next.lat === origin.lat && next.lng === origin.lng && path.length > 0) return;
-    setLivePath((p) => [...p, next]);
-  }, []);
+    const nextPoint = result.point;
+    if (!nextPoint) {
+      if (seedPath) setLivePath([origin]);
+      return seedPath ? origin : null;
+    }
 
-  // 5. Arduino Serial Logic
+    setLivePath((pathNow) => (pathNow.length === 0 ? [origin, nextPoint] : [...pathNow, nextPoint]));
+    return nextPoint;
+  }, [applyRealPosition]);
+
   const connectArduino = useCallback(async () => {
-    if (portRef.current) return; // already connected — ignore duplicate clicks / Strict Mode double invokes
+    if (portRef.current) return;
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const nav = navigator as any;
@@ -315,11 +365,11 @@ export default function OnlineMap() {
         alert("Web Serial is only supported in Chrome or Edge.");
         return;
       }
+
       const port = await nav.serial.requestPort();
       try {
         await port.open({ baudRate: 115200 });
       } catch (e) {
-        // Port may already be open from a prior HMR reload — proceed anyway.
         if (!(e instanceof DOMException && e.name === "InvalidStateError")) throw e;
       }
       portRef.current = port;
@@ -333,14 +383,20 @@ export default function OnlineMap() {
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
+        if (!value) continue;
         buffer += value;
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
+
         for (const line of lines) {
           const update = parseArduinoLine(line.trim());
           if (!update) continue;
-          setSensor((prev) => ({ ...prev, ...update }));
-          appendLivePoint(update);
+          const trackedPoint = appendLivePoint(update);
+          setSensor((prev) => ({
+            ...prev,
+            ...update,
+            ...(trackedPoint ? { lat: trackedPoint.lat, lng: trackedPoint.lng } : {}),
+          }));
         }
       }
     } catch (err) {
@@ -348,160 +404,96 @@ export default function OnlineMap() {
       setArduinoConnected(false);
     }
   }, [appendLivePoint]);
-  
-  // Manually retry GPS if it failed on page load.
+
   const retryGps = useCallback(() => {
     if (!navigator.geolocation) return;
     setGpsStatus("pending");
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        const origin: LivePoint = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-        gpsOriginRef.current = origin;
-        setGpsStatus("ok");
-        setSensor((s) => ({
-          ...s, lat: origin.lat, lng: origin.lng,
-          accuracy: Math.round(pos.coords.accuracy ?? 0),
-        }));
-        mapRef.current?.flyTo({ center: [origin.lng, origin.lat], zoom: 17, duration: 1500 });
+        applyRealPosition(
+          { lat: pos.coords.latitude, lng: pos.coords.longitude },
+          Math.round(pos.coords.accuracy ?? 0),
+          "browser"
+        );
       },
-      (err) => { console.warn("GPS retry failed:", err.message); setGpsStatus("error"); },
-      { enableHighAccuracy: false, timeout: 20000 }
+      (err) => {
+        console.warn("GPS retry failed:", err.message);
+        setGpsStatus("error");
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 }
     );
-  }, []);
+  }, [applyRealPosition]);
 
-  // Clear a finished recording (or return journey) and restore the Glen view.
   const clearRecording = useCallback(() => {
     setIsRecording(false);
     setIsReturnMode(false);
-    setLivePath([]);
-    if (userMarkerRef.current) {
-      userMarkerRef.current.remove();
-      userMarkerRef.current = null;
-    }
+    setLivePath(originRef.current ? [originRef.current] : []);
+    returnGuideRef.current = [];
+    resetDeadReckoningState(trackingRef.current);
     (mapRef.current?.getSource("live-path-source") as mapboxgl.GeoJSONSource | undefined)
       ?.setData({ type: "FeatureCollection", features: [] });
     (mapRef.current?.getSource("return-guide-source") as mapboxgl.GeoJSONSource | undefined)
       ?.setData({ type: "FeatureCollection", features: [] });
-    const trail = trailRef.current;
-    if (mapRef.current && trail.length > 0) {
-      const bounds = new mapboxgl.LngLatBounds();
-      trail.forEach((p) => bounds.extend([p.lng, p.lat]));
-      mapRef.current.fitBounds(bounds, { padding: 50, duration: 1200 });
-    }
   }, []);
 
-  // Show the reversed outbound path as an orange guide and start tracking
-  // the return journey from where recording stopped.
   const showReturnRoute = useCallback(() => {
     const outbound = livePathRef.current;
     if (outbound.length < 2) return;
+    const reversed = [...outbound].reverse();
+    returnGuideRef.current = reversed;
+    resetDeadReckoningState(trackingRef.current);
 
     (mapRef.current?.getSource("return-guide-source") as mapboxgl.GeoJSONSource | undefined)
       ?.setData({
-        type: "Feature", properties: {},
+        type: "Feature",
+        properties: {},
         geometry: {
           type: "LineString",
-          coordinates: [...outbound].reverse().map((p) => [p.lng, p.lat]),
+          coordinates: reversed.map((p) => [p.lng, p.lat]),
         },
       });
 
     const returnOrigin = outbound[outbound.length - 1];
-    gpsOriginRef.current = returnOrigin;
+    originRef.current = returnOrigin;
     setLivePath([returnOrigin]);
     setIsReturnMode(true);
     setIsRecording(true);
-    mapRef.current?.flyTo({ center: [returnOrigin.lng, returnOrigin.lat], zoom: 17, duration: 800 });
   }, []);
 
-  // Record Trail — uses the GPS origin captured at page load (GPS called only once).
-  // Falls back to trail start or last known origin when GPS is unavailable.
   const toggleRecord = useCallback(() => {
     setIsRecording((prev) => {
-      if (prev) return false; // stop
+      if (prev) return false;
+      const origin = originRef.current;
+      if (!origin) {
+        setGpsStatus("error");
+        return false;
+      }
 
-      const origin: LivePoint =
-        gpsOriginRef.current ??
-        (trailRef.current.length > 0
-          ? { lat: trailRef.current[0].lat, lng: trailRef.current[0].lng }
-          : { lat: 0, lng: 0 });
-
-      gpsOriginRef.current = origin;
+      resetDeadReckoningState(trackingRef.current);
+      if (!isReturnModeRef.current) returnGuideRef.current = [];
       setLivePath([origin]);
-      setSensor((s) => ({ ...s, lat: origin.lat, lng: origin.lng }));
-      mapRef.current?.flyTo({ center: [origin.lng, origin.lat], zoom: 17, duration: 1200 });
+      mapRef.current?.flyTo({ center: [origin.lng, origin.lat], zoom: 17, duration: 900 });
       return true;
     });
   }, []);
 
-  const stopDemo = useCallback(() => {
-    if (demoIntervalRef.current) {
-      clearInterval(demoIntervalRef.current);
-      demoIntervalRef.current = null;
-    }
-  }, []);
-
-  const toggleDemo = useCallback(() => {
-    setIsDemoMode((prev) => {
-      const next = !prev;
-      if (!next) {
-        stopDemo();
-        return next;
-      }
-
-      const trail = trailRef.current;
-      if (trail.length < 2) return prev; // nothing to walk
-
-      // Reset path to trail start so the demo trip animates from the beginning.
-      demoIndexRef.current = 0;
-      const start = trail[0];
-      setLivePath([{ lat: start.lat, lng: start.lng }]);
-      setSensor((s) => ({ ...s, lat: start.lat, lng: start.lng, altitude: start.elevation }));
-      mapRef.current?.flyTo({ center: [start.lng, start.lat], zoom: 17, duration: 1200 });
-
-      demoIntervalRef.current = setInterval(() => {
-        const t = trailRef.current;
-        const i = ++demoIndexRef.current;
-        if (i >= t.length) {
-          stopDemo();
-          setIsDemoMode(false);
-          return;
-        }
-        const p = t[i];
-        const q = t[i - 1];
-        const hdg = bearing(q.lat, q.lng, p.lat, p.lng);
-        setSensor((s) => ({ ...s, lat: p.lat, lng: p.lng, heading: hdg, altitude: p.elevation }));
-        setLivePath((lp) => [...lp, { lat: p.lat, lng: p.lng }]);
-      }, 200);
-
-      return next;
-    });
-  }, [stopDemo]);
-
-  useEffect(() => () => stopDemo(), [stopDemo]);
-  // 6. Canvas Compass Render
-  useEffect(() => {
-    if (compassRef.current) {
-      renderCompass(compassRef.current, sensor.heading);
-    }
-  }, [sensor.heading]);
-
   const aq = aqStatus(sensor.ppm);
+  const coordText = hasOrigin ? `${sensor.lat.toFixed(6)}, ${sensor.lng.toFixed(6)}` : "--";
 
   return (
     <div className="flex flex-col h-screen w-full bg-black text-white font-mono select-none overflow-hidden">
-      {/* Header */}
       <header className="flex items-center justify-between px-4 py-2 border-b border-gray-800 shrink-0">
         <div className="flex items-center gap-3">
-          <span className="text-sm font-bold tracking-widest">Online Trail Navigator</span>
-          <span className="text-[10px] bg-orange-600 text-white px-2 py-0.5 rounded font-bold tracking-widest">
-            ONLINE
+          <span className="text-sm font-bold tracking-widest">TrailBack</span>
+          <span className="text-[10px] bg-cyan-700 text-white px-2 py-0.5 rounded font-bold tracking-widest">
+            Grp5 - Kirtan, Neel, Nundun, Jose
           </span>
         </div>
         <div className="flex items-center gap-4">
-          <span className={`text-xs flex items-center gap-1.5 ${gpsStatus === "ok" ? "text-green-400" : gpsStatus === "error" ? "text-yellow-400" : "text-gray-400"}`}>
-            <span className={`w-2 h-2 rounded-full inline-block ${gpsStatus === "ok" ? "bg-green-500" : gpsStatus === "error" ? "bg-yellow-500" : "bg-gray-500 animate-pulse"}`} />
-            {gpsStatus === "ok" ? "GPS" : gpsStatus === "error" ? "GPS N/A" : "GPS…"}
-            {gpsStatus === "error" && (
+          <span className={`text-xs flex items-center gap-1.5 ${gpsStatus === "ok" || originSource === "serial" ? "text-green-400" : gpsStatus === "error" ? "text-yellow-400" : "text-gray-400"}`}>
+            <span className={`w-2 h-2 rounded-full inline-block ${gpsStatus === "ok" || originSource === "serial" ? "bg-green-500" : gpsStatus === "error" ? "bg-yellow-500" : "bg-gray-500 animate-pulse"}`} />
+            {originSource === "serial" ? "Serial GPS" : gpsStatus === "ok" ? "GPS" : gpsStatus === "error" ? "Origin Needed" : "Locating"}
+            {gpsStatus === "error" && originSource !== "serial" && (
               <button onClick={retryGps} className="text-[10px] underline text-yellow-400 cursor-pointer ml-0.5">retry</button>
             )}
           </span>
@@ -509,47 +501,36 @@ export default function OnlineMap() {
             <span className={`w-2 h-2 rounded-full inline-block ${arduinoConnected ? "bg-green-500" : "bg-gray-600"}`} />
             Arduino
           </span>
-          <button
-            onClick={toggleDemo}
-            className={`text-[11px] px-3 py-1 rounded border transition-colors cursor-pointer ${
-              isDemoMode
-                ? "border-white text-white bg-white/10"
-                : "border-gray-600 text-gray-300 hover:border-gray-500"
-            }`}
-          >
-            Demo Mode
-          </button>
           {!isReturnMode && (
             <button
               onClick={toggleRecord}
-              disabled={!arduinoConnected}
+              disabled={!hasOrigin}
               className={`text-[11px] px-3 py-1 rounded border transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
                 isRecording
                   ? "border-red-500 text-red-400 bg-red-500/10"
                   : "border-gray-600 text-gray-300 hover:border-gray-500"
               }`}
             >
-              {isRecording ? "● Recording" : "Record Trail"}
+              {isRecording ? "● Tracking" : "Start Track"}
             </button>
           )}
           {isReturnMode && (
             <button
               onClick={toggleRecord}
-              disabled={!arduinoConnected}
+              disabled={!hasOrigin}
               className={`text-[11px] px-3 py-1 rounded border transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
                 isRecording
                   ? "border-orange-500 text-orange-400 bg-orange-500/10"
                   : "border-gray-600 text-gray-300 hover:border-gray-500"
               }`}
             >
-              {isRecording ? "↩ Returning" : "↩ Return Route"}
+              {isRecording ? "↩ Returning" : "↩ Return"}
             </button>
           )}
           {!isRecording && livePath.length > 1 && !isReturnMode && (
             <button
               onClick={showReturnRoute}
-              disabled={!arduinoConnected}
-              className="text-[11px] px-3 py-1 rounded border border-orange-600 text-orange-400 hover:border-orange-500 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              className="text-[11px] px-3 py-1 rounded border border-orange-600 text-orange-400 hover:border-orange-500 cursor-pointer transition-colors"
             >
               ↩ Return Route
             </button>
@@ -559,7 +540,7 @@ export default function OnlineMap() {
               onClick={clearRecording}
               className="text-[11px] px-3 py-1 rounded border border-gray-600 text-gray-300 hover:border-gray-500 cursor-pointer transition-colors"
             >
-              ✕ Clear
+              Clear
             </button>
           )}
           {!arduinoConnected && (
@@ -573,39 +554,26 @@ export default function OnlineMap() {
         </div>
       </header>
 
-      {/* Body */}
       <div className="flex flex-1 overflow-hidden relative">
-        {/* Map Container */}
         <main className="flex-1 relative bg-zinc-900">
-          <div 
-            ref={mapContainerRef} 
-            className="absolute inset-0 w-full h-full" 
-          />
-          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1 pointer-events-none">
-            <span className="text-[10px] text-gray-400 tracking-widest font-mono">ALTITUDE</span>
-            <div className="flex items-center gap-2">
-              <span className="text-[10px] text-white font-mono">Low</span>
-              <div
-                className="w-40 h-3 rounded"
-                style={{ background: "linear-gradient(to right, rgb(0,255,0), rgb(255,255,0), rgb(255,165,0), rgb(255,0,0))" }}
-              />
-              <span className="text-[10px] text-white font-mono">High</span>
-            </div>
-          </div>
-          {/* Top-Left HUD */}
-          <div className="absolute top-4 left-4 p-3 bg-black/70 border border-gray-800 backdrop-blur-md rounded-sm z-10 pointer-events-none min-w-[140px]">
-            <p className="text-[9px] text-gray-500 mb-1 tracking-tighter">GPS_COORDINATES</p>
-            <p className="text-xs text-blue-400 tabular-nums">LAT: {sensor.lat.toFixed(6)}</p>
-            <p className="text-xs text-blue-400 tabular-nums">LNG: {sensor.lng.toFixed(6)}</p>
+          <div ref={mapContainerRef} className="absolute inset-0 w-full h-full" />
+          <div className="absolute top-4 left-4 p-3 bg-black/70 border border-gray-800 backdrop-blur-md rounded-sm z-10 pointer-events-none min-w-[190px]">
+            <p className="text-[9px] text-gray-500 mb-1 tracking-tighter">LIVE_POSITION</p>
+            <p className="text-xs text-cyan-300 tabular-nums">{coordText}</p>
+            <p className="text-[10px] text-gray-400 mt-1">Source: {originSource === "none" ? "--" : originSource}</p>
           </div>
         </main>
 
-        {/* Sidebar */}
         <aside className="w-52 shrink-0 border-l border-gray-800 overflow-y-auto bg-black">
-          <SidePanel label="GPS POSITION">
-            <SideRow label="Lat" value={sensor.lat.toFixed(6)} />
-            <SideRow label="Lng" value={sensor.lng.toFixed(6)} />
-            <SideRow label="Accuracy" value={`±${sensor.accuracy} m`} />
+          <SidePanel label="POSITION">
+            <SideRow label="Lat" value={hasOrigin ? sensor.lat.toFixed(6) : "--"} />
+            <SideRow label="Lng" value={hasOrigin ? sensor.lng.toFixed(6) : "--"} />
+            <SideRow label="Accuracy" value={sensor.accuracy > 0 ? `±${sensor.accuracy} m` : "--"} />
+            <SideRow
+              label="Motion"
+              value={motionLabel}
+              valueColor={motionColor}
+            />
           </SidePanel>
 
           <SidePanel label="COMPASS - LSM303">
@@ -620,17 +588,18 @@ export default function OnlineMap() {
             <SideRow label="Temp" value={`${sensor.temp.toFixed(1)} °C`} />
             <SideRow label="Pressure" value={`${sensor.pressure} hPa`} />
             <SideRow label="Altitude" value={`${sensor.altitude.toFixed(1)} m`} />
+            <AltitudeSparkline value={sensor.altitude} />
           </SidePanel>
 
           <SidePanel label="AIR QUALITY - MQ135">
-            <SideRow label="CO₂" value={aq.label} valueColor={aq.color} />
+            <SideRow label="CO2" value={aq.label} valueColor={aq.color} />
             <SideRow label="PPM" value={`${sensor.ppm} ppm`} />
           </SidePanel>
 
           <SidePanel label="ACCEL - MPU6050">
-            <BarRow label="X" value={sensor.accelX} range={32768} />
-            <BarRow label="Y" value={sensor.accelY} range={32768} />
-            <BarRow label="Z" value={sensor.accelZ} range={32768} />
+            <BarRow label="X" value={sensor.accelX} range={8000} />
+            <BarRow label="Y" value={sensor.accelY} range={8000} />
+            <BarRow label="Z" value={sensor.accelZ} range={8000} />
           </SidePanel>
 
           <SidePanel label="GYRO - MPU6050">
@@ -644,8 +613,6 @@ export default function OnlineMap() {
   );
 }
 
-// --- UTILITY FUNCTIONS ---
-
 function headingToDir(h: number): string {
   const d = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
   return d[Math.round(h / 22.5) % 16];
@@ -653,9 +620,6 @@ function headingToDir(h: number): string {
 
 function aqStatus(ppm: number) {
   if (ppm <= 0) return { label: "NO DATA", color: "#6b7280" };
-
-  // Hanwei MQ135 resistance/conductivity response: target gas concentration
-  // rises as sensor resistance/RsRo-style readings fall.
   if (ppm < 450) return { label: "POOR", color: "#ef4444" };
   if (ppm < 1000) return { label: "MODERATE", color: "#eab308" };
   return { label: "EXCELLENT", color: "#22c55e" };
@@ -668,28 +632,29 @@ function renderCompass(canvas: HTMLCanvasElement, heading: number) {
   const cx = w / 2, cy = h / 2, r = (w / 2) - 5;
 
   ctx.clearRect(0, 0, w, h);
-  
-  // Outer Ring
   ctx.beginPath();
   ctx.arc(cx, cy, r, 0, Math.PI * 2);
-  ctx.strokeStyle = "#333"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.strokeStyle = "#333";
+  ctx.lineWidth = 2;
+  ctx.stroke();
 
-  ctx.font = "bold 12px monospace";
-  ctx.fillStyle = "#ef4444";
-  ctx.textAlign = "center";
-  
-  // Rotating needle
   ctx.save();
   ctx.translate(cx, cy);
-  ctx.rotate(heading * Math.PI / 180);
-  
+  ctx.rotate((heading * Math.PI) / 180);
+
   ctx.beginPath();
-  ctx.moveTo(0, -r + 10); ctx.lineTo(6, 0); ctx.lineTo(-6, 0);
-  ctx.fillStyle = "#ef4444"; ctx.fill();
-  
+  ctx.moveTo(0, -r + 10);
+  ctx.lineTo(6, 0);
+  ctx.lineTo(-6, 0);
+  ctx.fillStyle = "#ef4444";
+  ctx.fill();
+
   ctx.beginPath();
-  ctx.moveTo(0, r - 10); ctx.lineTo(6, 0); ctx.lineTo(-6, 0);
-  ctx.fillStyle = "#fff"; ctx.fill();
+  ctx.moveTo(0, r - 10);
+  ctx.lineTo(6, 0);
+  ctx.lineTo(-6, 0);
+  ctx.fillStyle = "#fff";
+  ctx.fill();
   ctx.restore();
 }
 
@@ -718,16 +683,21 @@ function parseArduinoLine(line: string): Partial<Sensor> | null {
       case "GX": update.gyroX = v; any = true; break;
       case "GY": update.gyroY = v; any = true; break;
       case "GZ": update.gyroZ = v; any = true; break;
+      case "AMG": update.accelMagDelta = v; any = true; break;
+      case "JRK": update.accelJerk = v; any = true; break;
+      case "GMG": update.gyroMag = v; any = true; break;
       case "MOV":
       case "MOVE":
       case "MOTION":
       case "MOVING": update.moving = v; any = true; break;
+      case "TURN":
+      case "ROT":
+      case "ROTATE":
+      case "ROTATING": update.turning = v; any = true; break;
     }
   }
   return any ? update : null;
 }
-
-// --- UI COMPONENTS ---
 
 function SidePanel({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -765,7 +735,60 @@ function BarRow({ label, value, range }: { label: string; value: number; range: 
       <div className="flex-1 h-[3px] bg-gray-800 rounded-full">
         <div className="h-[3px] bg-white rounded-full" style={{ width: `${pct}%` }} />
       </div>
-      <span className="text-[11px] text-white w-8 text-right shrink-0">{value}</span>
+      <span className="text-[11px] text-white w-8 text-right shrink-0">{Math.round(value)}</span>
+    </div>
+  );
+}
+
+function AltitudeSparkline({ value }: { value: number }) {
+  const [history, setHistory] = useState<number[]>([]);
+
+  useEffect(() => {
+    if (!Number.isFinite(value) || value <= 0) return;
+    setHistory((prev) => [...prev, value].slice(-48));
+  }, [value]);
+
+  const values = history.length > 0 ? history : Number.isFinite(value) && value > 0 ? [value] : [];
+  const width = 100;
+  const height = 36;
+  const pad = 4;
+
+  if (values.length === 0) {
+    return <div className="h-10 rounded-sm bg-gray-950 border border-gray-900" />;
+  }
+
+  const minValue = Math.min(...values);
+  const maxValue = Math.max(...values);
+  const center = (minValue + maxValue) / 2;
+  const range = Math.max(maxValue - minValue, 0.6);
+  const min = center - range / 2;
+  const latest = values[values.length - 1];
+  const first = values[0];
+  const delta = latest - first;
+
+  const points = values.length === 1
+    ? `0,${height / 2} ${width},${height / 2}`
+    : values
+        .map((altitude, index) => {
+          const x = (index / (values.length - 1)) * width;
+          const normalized = (altitude - min) / range;
+          const y = height - pad - normalized * (height - pad * 2);
+          return `${x.toFixed(1)},${y.toFixed(1)}`;
+        })
+        .join(" ");
+
+  return (
+    <div className="mt-2 rounded-sm border border-gray-800 bg-gray-950 px-2 py-1">
+      <div className="flex items-center justify-between text-[9px]">
+        <span className="text-gray-500">Height</span>
+        <span className={delta >= 0 ? "text-cyan-300" : "text-orange-300"}>
+          {delta >= 0 ? "+" : ""}{delta.toFixed(1)} m
+        </span>
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} className="mt-1 h-9 w-full" aria-hidden="true">
+        <line x1="0" y1={height / 2} x2={width} y2={height / 2} stroke="#1f2937" strokeWidth="1" strokeDasharray="2 3" />
+        <polyline points={points} fill="none" stroke="#67e8f9" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
     </div>
   );
 }
